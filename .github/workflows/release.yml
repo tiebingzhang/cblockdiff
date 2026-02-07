@@ -3,6 +3,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:  
+    inputs:  
+      create_release:  
+        description: 'Create actual release'  
+        required: false  
+        default: 'false'
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -24,6 +30,11 @@ jobs:
           targets: ${{ matrix.target }}  
       - run: cargo build --release --target ${{ matrix.target }}  
       - run: mv target/${{ matrix.target }}/release/blockdiff ${{ matrix.artifact }}
-      - uses: softprops/action-gh-release@v1
+      - uses: actions/upload-artifact@v4
         with:
-          files: target/release/blockdiff*
+          name: blockdiff-${{ matrix.target }}
+          path: blockdiff-${{ matrix.target }}
+
+        # - uses: softprops/action-gh-release@v1
+        # with:
+        #  files: target/release/blockdiff*
