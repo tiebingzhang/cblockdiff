@@ -17,8 +17,6 @@ jobs:
         include:  
           - target: x86_64-unknown-linux-gnu  
             artifact: blockdiff-x86_64  
-          - target: aarch64-unknown-linux-gnu  
-            artifact: blockdiff-aarch64  
     steps:  
       - uses: actions/checkout@v4  
       - name: Install cross-compilation tools  
@@ -32,8 +30,8 @@ jobs:
       - run: mv target/${{ matrix.target }}/release/blockdiff ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
-          name: blockdiff-${{ matrix.target }}
-          path: blockdiff-${{ matrix.target }}
+          name: ${{ matrix.artifact}}
+          path: ${{ matrix.artifact}}
 
         # - uses: softprops/action-gh-release@v1
         # with:
