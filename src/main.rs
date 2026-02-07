@@ -20,9 +20,9 @@ enum Commands {
         bdiff_output: String,
         /// Path to the target file to diff
         target_file: String,
-        /// Path to the base file to compare against (optional)
-        #[arg(long)]
-        base: Option<String>,
+        /// Comma-separated base file and optional diff files (e.g., "base.img,diff1.bdiff,diff2.bdiff")
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        base: Option<Vec<String>>,
     },
     /// Apply a block-level diff to create a new file
     Apply {
@@ -30,9 +30,9 @@ enum Commands {
         bdiff_input: String,
         /// Path where to create the target file
         target_file: String,
-        /// Path to the base file (optional)
-        #[arg(long)]
-        base: Option<String>,
+        /// Comma-separated base file and optional diff files (e.g., "base.img,diff1.bdiff,diff2.bdiff")
+        #[arg(long, value_delimiter = ',', num_args = 1..)]
+        base: Option<Vec<String>>,
     },
     /// View header information & extent map from a bdiff file
     View {
@@ -44,7 +44,7 @@ enum Commands {
 }
 
 /// Represents a range in the target file that's different from the base file (as indicated by the CoW metadata)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiffRange {
     logical_offset: u64,
     length: u64,
@@ -52,6 +52,15 @@ struct DiffRange {
 
 /// Magic string for bdiff files ("BDIFFv1\0")
 const MAGIC: &[u8; 8] = b"BDIFFv1\0";
+
+fn split_base_and_diffs(base: Option<&[String]>) -> (Option<&str>, Option<&[String]>) {
+    match base {
+        None => (None, None),
+        Some(parts) if parts.is_empty() => (None, None),
+        Some(parts) => (Some(parts[0].as_str()), if parts.len() > 1 { Some(&parts[1..]) } else { None }),
+    }
+}
+
 
 /// Standard block size used for alignment (4 KiB)
 const BLOCK_SIZE: usize = 4096;
@@ -347,10 +356,70 @@ fn copy_range(
     Ok(copied_total)
 }
 
+/// Merge overlapping or adjacent ranges, returning a sorted, non-overlapping list
+fn merge_ranges(mut ranges: Vec<DiffRange>) -> Vec<DiffRange> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    
+    ranges.sort_by_key(|r| r.logical_offset);
+    let mut merged = Vec::new();
+    let mut current = ranges[0].clone();
+    
+    for range in ranges.into_iter().skip(1) {
+        let current_end = current.logical_offset + current.length;
+        let range_end = range.logical_offset + range.length;
+        
+        if range.logical_offset <= current_end {
+            // Overlapping or adjacent - merge
+            current.length = range_end.max(current_end) - current.logical_offset;
+        } else {
+            // Gap - push current and start new
+            merged.push(current);
+            current = range;
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+/// Load and merge multiple bdiff files into a single set of ranges
+fn load_and_merge_diffs(base_size: u64, diff_files: &[String]) -> Result<(u64, Vec<DiffRange>), Error> {
+    let mut current_size = base_size;
+    let mut all_ranges = Vec::new();
+    
+    for (idx, diff_file) in diff_files.iter().enumerate() {
+        let mut diff_in = File::open(diff_file).map_err(|e| {
+            Error::new(
+                e.kind(),
+                format!("Failed to open diff file '{}': {}", diff_file, e),
+            )
+        })?;
+        let header = BDiffHeader::read_from(&mut diff_in)?;
+        
+        // Validate that this diff is compatible with current state
+        if header.base_size != current_size {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Diff file '{}' (index {}) is incompatible: expected base size {}, but diff expects {}. Diffs may be in wrong order or incompatible.",
+                    diff_file, idx, current_size, header.base_size
+                ),
+            ));
+        }
+        
+        all_ranges.extend(header.ranges);
+        current_size = header.target_size;
+    }
+    
+    Ok((current_size, merge_ranges(all_ranges)))
+}
+
 fn create_diff(
     bdiff_output: &str,
     target_file: &str,
     base_file: Option<&str>,
+    diff_files: Option<&[String]>,
 ) -> Result<(), Error> {
     // 1) Open the target file so we can copy bytes from it later
     let target = File::open(target_file).map_err(|e| {
@@ -363,7 +432,24 @@ fn create_diff(
     // Sync the target file to ensure all delayed allocations are resolved
     nix::unistd::fsync(target.as_raw_fd()).map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
-    let base = if let Some(base) = base_file {
+    let target_size = target.metadata()?.len();
+    
+    // Handle merged base: if we have diff files, create a temporary merged base
+    let temp_base_path;
+    let effective_base_path = if let Some(diffs) = diff_files {
+        if diffs.is_empty() {
+            base_file
+        } else {
+            // Create temporary merged base
+            temp_base_path = format!("{}.tmp_merged_base", bdiff_output);
+            apply_diff_chain(base_file, diffs, &temp_base_path)?;
+            Some(temp_base_path.as_str())
+        }
+    } else {
+        base_file
+    };
+
+    let base = if let Some(base) = effective_base_path {
         File::open(base).map_err(|e| {
             Error::new(
                 e.kind(),
@@ -378,11 +464,10 @@ fn create_diff(
             )
         })?
     };
-    let target_size = target.metadata()?.len();
     let base_size = base.metadata()?.len();
 
     // 2) Compute the diff ranges
-    let diff_ranges = get_different_ranges(target_file, base_file)?;
+    let diff_ranges = get_different_ranges(target_file, effective_base_path)?;
     let total_size: u64 = diff_ranges.iter().map(|range| range.length).sum();
     println!("Size of blockdiff: {}", format_size(total_size));
 
@@ -426,12 +511,48 @@ fn create_diff(
         }
     }
 
+    // 7) Clean up temporary merged base if created
+    if let Some(diffs) = diff_files {
+        if !diffs.is_empty() {
+            let temp_path = format!("{}.tmp_merged_base", bdiff_output);
+            let _ = std::fs::remove_file(&temp_path); // Ignore errors on cleanup
+        }
+    }
+
     println!("Successfully created blockdiff file at {}", bdiff_output);
 
     Ok(())
 }
 
-fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
+/// Apply a chain of diffs to create a merged file
+fn apply_diff_chain(base_file: Option<&str>, diff_files: &[String], output_file: &str) -> Result<(), Error> {
+    if diff_files.is_empty() {
+        return Err(Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "No diff files provided to apply_diff_chain",
+        ));
+    }
+    
+    // Apply first diff
+    apply_diff_single(&diff_files[0], output_file, base_file)?;
+    
+    // Apply remaining diffs sequentially
+    for diff_file in &diff_files[1..] {
+        // Create temp file for intermediate result
+        let temp_output = format!("{}.tmp", output_file);
+        std::fs::rename(output_file, &temp_output)?;
+        
+        apply_diff_single(diff_file, output_file, Some(&temp_output))?;
+        
+        // Clean up temp
+        std::fs::remove_file(&temp_output)?;
+    }
+    
+    Ok(())
+}
+
+/// Apply a single diff file (internal helper)
+fn apply_diff_single(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> Result<(), Error> {
     // Open the diff file and read header
     let mut diff_in = File::open(bdiff_input).map_err(|e| {
         Error::new(
@@ -525,6 +646,27 @@ fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>) -> 
     println!("Successfully applied {} to target file", bdiff_input);
 
     Ok(())
+}
+
+fn apply_diff(bdiff_input: &str, target_file: &str, base_file: Option<&str>, prev_diffs: Option<&[String]>) -> Result<(), Error> {
+    // If we have prev_diffs, create a merged base first
+    if let Some(prev) = prev_diffs {
+        if !prev.is_empty() {
+            let temp_base = format!("{}.tmp_merged_base", target_file);
+            apply_diff_chain(base_file, prev, &temp_base)?;
+            
+            // Apply the final diff
+            apply_diff_single(bdiff_input, target_file, Some(&temp_base))?;
+            
+            // Clean up temp base
+            std::fs::remove_file(&temp_base)?;
+            
+            return Ok(());
+        }
+    }
+    
+    // No prev_diffs, just apply normally
+    apply_diff_single(bdiff_input, target_file, base_file)
 }
 
 fn debug_viewer(input_file: &str, offset_str: Option<&str>) -> Result<(), Error> {
@@ -664,12 +806,18 @@ fn main() -> Result<(), Error> {
             bdiff_output,
             target_file,
             base,
-        } => create_diff(bdiff_output, target_file, base.as_deref()),
+        } => {
+            let (base_file, diffs) = split_base_and_diffs(base.as_deref());
+            create_diff(bdiff_output, target_file, base_file, diffs)
+        }
         Commands::Apply {
             bdiff_input,
             target_file,
             base,
-        } => apply_diff(bdiff_input, target_file, base.as_deref()),
+        } => {
+            let (base_file, prev_diffs) = split_base_and_diffs(base.as_deref());
+            apply_diff(bdiff_input, target_file, base_file, prev_diffs)
+        }
         Commands::View {
             bdiff_input,
             offset,
