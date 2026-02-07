@@ -8,6 +8,9 @@ Fast block-level file diffs (e.g. for VM disk images) using CoW filesystem metad
 
 ### File snapshots
 
+> [!NOTE]
+> this needs to be used within a XFS partition, not EXT4.
+
 Creating a snapshot:
 
 ```
