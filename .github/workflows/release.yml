@@ -34,4 +34,4 @@ jobs:
         #          path: ${{ matrix.artifact}}
       - uses: softprops/action-gh-release@v1
         with:
-          files: target/release/blockdiff-*
+          files: blockdiff-*
